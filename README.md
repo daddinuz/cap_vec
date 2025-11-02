@@ -85,13 +85,13 @@ or edit your Cargo.toml manually by adding:
 
 ```toml
 [dependencies]
-cap_vec = "0.1"
+cap_vec = "0.2"
 ```
 
 ## Safety and Coverage
 
 This crate contains a small portion of unsafe code.  
-All tests run under [miri](https://github.com/rust-lang/miri) and the tests cover about 70% of the code.  
+All tests run under [miri](https://github.com/rust-lang/miri) and the tests cover about 80% of the code.  
 You can generate the coverage report using [tarpaulin](https://github.com/xd009642/tarpaulin).
 
 ## Contributions
