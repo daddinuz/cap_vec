@@ -2,7 +2,7 @@
 authors = ["Davide Di Carlo <daddinuz@gmail.com>"]
 description = "A heap-allocated, fixed-capacity, variable-size array, no_std compatible."
 name = "cap_vec"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 keywords = ["array", "collections", "list", "vec", "heap"]

@@ -40,6 +40,7 @@ use core::hash::Hash;
 use core::iter::FusedIterator;
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut, Range};
+use core::slice::{Iter, IterMut};
 
 /// A heap-allocated, fixed-capacity, variable-size array.
 ///
@@ -140,7 +141,23 @@ impl<T, const N: usize> CapVec<T, N> {
     /// assert_eq!(v.push(30), Err(30)); // full
     /// ```
     pub fn push(&mut self, element: T) -> Result<(), T> {
-        self.insert(self.len, element)
+        if self.len >= N {
+            return Err(element);
+        }
+
+        let ptr = self
+            .buf
+            .get_or_insert_with(|| Box::new([const { MaybeUninit::uninit() }; N]))
+            .as_mut_ptr();
+
+        unsafe {
+            // Write the new element at the specified index
+            ptr.add(self.len).write(MaybeUninit::new(element));
+        }
+
+        // Increment the size of the array
+        self.len += 1;
+        Ok(())
     }
 
     /// Inserts an element at the given index, shifting subsequent elements to the right.
@@ -163,12 +180,12 @@ impl<T, const N: usize> CapVec<T, N> {
             return Err(element);
         }
 
-        unsafe {
-            let ptr = self
-                .buf
-                .get_or_insert_with(|| Box::new([const { MaybeUninit::uninit() }; N]))
-                .as_mut_ptr();
+        let ptr = self
+            .buf
+            .get_or_insert_with(|| Box::new([const { MaybeUninit::uninit() }; N]))
+            .as_mut_ptr();
 
+        unsafe {
             // Shift elements starting from the index to the right
             core::ptr::copy(ptr.add(index), ptr.add(index + 1), self.len - index);
 
@@ -192,7 +209,19 @@ impl<T, const N: usize> CapVec<T, N> {
     /// assert_eq!(v.as_slice(), &[1, 2]);
     /// ```
     pub fn pop(&mut self) -> Option<T> {
-        self.remove(self.len.saturating_sub(1))
+        if self.is_empty() {
+            return None;
+        }
+
+        debug_assert!(self.buf.is_some());
+        let buf = unsafe { self.buf.as_mut().unwrap_unchecked() };
+
+        // Decrement the len of the array
+        self.len -= 1;
+
+        // Read the element to be removed
+        let element = unsafe { buf[self.len].assume_init_read() };
+        Some(element)
     }
 
     /// Removes and returns the element at the given index, shifting subsequent elements left.
@@ -211,54 +240,47 @@ impl<T, const N: usize> CapVec<T, N> {
             return None;
         }
 
-        // Read the element to be removed
-        let element = unsafe { self.buf.as_mut().unwrap()[index].assume_init_read() };
+        debug_assert!(self.buf.is_some());
+        let buf = unsafe { self.buf.as_mut().unwrap_unchecked() };
+        let ptr = buf.as_mut_ptr();
 
-        unsafe {
-            // Shift elements from `index + 1` to fill the gap
-            let ptr = self.buf.as_mut().unwrap().as_mut_ptr();
-            core::ptr::copy(ptr.add(index + 1), ptr.add(index), self.len - index - 1);
-        }
+        // Read the element to be removed
+        let element = unsafe { buf[index].assume_init_read() };
 
         // Decrement the len of the array
         self.len -= 1;
+
+        // Shift elements to fill the gap
+        unsafe {
+            core::ptr::copy(ptr.add(index + 1), ptr.add(index), self.len - index);
+        }
+
         Some(element)
     }
 
     /// Returns a shared slice over the initialized portion of the buffer.
-    #[inline]
     pub fn as_slice(&self) -> &[T] {
         self.deref()
     }
 
     /// Returns a mutable slice over the initialized portion of the buffer.
-    #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         self.deref_mut()
     }
 
     /// Returns the compile-time capacity of the vector.
-    #[inline]
     pub const fn capacity(&self) -> usize {
         N
     }
 
     /// Returns the current number of initialized elements.
-    #[inline]
     pub const fn len(&self) -> usize {
         self.len
     }
 
     /// Returns `true` if the vector contains no elements.
-    #[inline]
     pub const fn is_empty(&self) -> bool {
-        self.len == 0 && N > 0
-    }
-
-    /// Returns `true` if the vector has reached its capacity.
-    #[inline]
-    pub const fn is_full(&self) -> bool {
-        self.len == N
+        self.len == 0
     }
 
     /// Removes the subslice indicated by the given range from the vector,
@@ -321,25 +343,13 @@ impl<T, const N: usize> CapVec<T, N> {
     }
 
     /// Returns an iterator over immutable references to the elements.
-    pub fn iter(&self) -> Iter<'_, T, N> {
-        if self.is_empty() {
-            return Iter::default();
-        }
-
-        Iter {
-            inner: self.buf.as_ref().unwrap().iter().take(self.len),
-        }
+    pub fn iter(&self) -> Iter<'_, T> {
+        self.as_slice().iter()
     }
 
     /// Returns an iterator over mutable references to the elements.
-    pub fn iter_mut(&mut self) -> IterMut<'_, T, N> {
-        if self.is_empty() {
-            return IterMut::default();
-        }
-
-        IterMut {
-            inner: self.buf.as_mut().unwrap().iter_mut().take(self.len),
-        }
+    pub fn iter_mut(&mut self) -> IterMut<'_, T> {
+        self.as_mut_slice().iter_mut()
     }
 
     /// Drops all elements and resets the vector to an empty state.
@@ -355,9 +365,9 @@ impl<T, const N: usize> CapVec<T, N> {
     /// ```
     pub fn clear(&mut self) {
         if let Some(slice) = self.buf.as_mut() {
-            slice[..self.len].iter_mut().for_each(|e| unsafe {
-                e.assume_init_drop();
-            });
+            slice[..self.len]
+                .iter_mut()
+                .for_each(|e| unsafe { e.assume_init_drop() });
         }
 
         self.len = 0;
@@ -393,19 +403,18 @@ impl<T, const N: usize> IntoIterator for CapVec<T, N> {
     type IntoIter = IntoIter<T, N>;
 
     fn into_iter(mut self) -> Self::IntoIter {
-        if self.is_empty() {
-            return IntoIter::default();
-        }
-
-        IntoIter {
-            inner: self.buf.take().unwrap().into_iter().take(self.len),
+        match self.buf.take() {
+            None => IntoIter::default(),
+            Some(buf) => IntoIter {
+                inner: buf.into_iter().take(self.len),
+            },
         }
     }
 }
 
 impl<'a, T, const N: usize> IntoIterator for &'a CapVec<T, N> {
     type Item = &'a T;
-    type IntoIter = Iter<'a, T, N>;
+    type IntoIter = Iter<'a, T>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -414,7 +423,7 @@ impl<'a, T, const N: usize> IntoIterator for &'a CapVec<T, N> {
 
 impl<'a, T, const N: usize> IntoIterator for &'a mut CapVec<T, N> {
     type Item = &'a mut T;
-    type IntoIter = IterMut<'a, T, N>;
+    type IntoIter = IterMut<'a, T>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()
@@ -542,6 +551,7 @@ impl<'a, T, const N: usize> Iterator for Drain<'a, T, N> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let index = self.leftover_range.next()?;
+        debug_assert!(self.vec.buf.is_some());
         let element = unsafe { self.vec.buf.as_mut().unwrap_unchecked()[index].assume_init_read() };
         Some(element)
     }
@@ -554,6 +564,7 @@ impl<'a, T, const N: usize> Iterator for Drain<'a, T, N> {
 impl<T, const N: usize> DoubleEndedIterator for Drain<'_, T, N> {
     fn next_back(&mut self) -> Option<Self::Item> {
         let index = self.leftover_range.next_back()?;
+        debug_assert!(self.vec.buf.is_some());
         let element = unsafe { self.vec.buf.as_mut().unwrap_unchecked()[index].assume_init_read() };
         Some(element)
     }
@@ -569,125 +580,23 @@ impl<T, const N: usize> ExactSizeIterator for Drain<'_, T, N> {
 
 impl<T, const N: usize> Drop for Drain<'_, T, N> {
     fn drop(&mut self) {
-        for index in self.leftover_range.clone() {
-            unsafe { self.vec.buf.as_mut().unwrap_unchecked()[index].assume_init_drop() };
-        }
+        if let Some(buf) = self.vec.buf.as_mut() {
+            for index in self.leftover_range.clone() {
+                unsafe { buf[index].assume_init_drop() };
+            }
 
-        unsafe {
-            let ptr = self.vec.buf.as_mut().unwrap().as_mut_ptr();
-            core::ptr::copy(
-                ptr.add(self.drop_range.end),
-                ptr.add(self.drop_range.start),
-                self.original_len - self.drop_range.end,
-            );
+            let ptr = buf.as_mut_ptr();
+
+            unsafe {
+                core::ptr::copy(
+                    ptr.add(self.drop_range.end),
+                    ptr.add(self.drop_range.start),
+                    self.original_len - self.drop_range.end,
+                );
+            }
         }
 
         self.vec.len = self.original_len - self.drop_range.len();
-    }
-}
-
-// ---
-
-#[derive(Clone)]
-pub struct Iter<'a, T, const N: usize> {
-    inner: core::iter::Take<core::slice::Iter<'a, MaybeUninit<T>>>,
-}
-
-impl<T, const N: usize> Default for Iter<'_, T, N> {
-    fn default() -> Self {
-        Self {
-            inner: [].iter().take(0),
-        }
-    }
-}
-
-impl<T, const N: usize> core::fmt::Debug for Iter<'_, T, N>
-where
-    T: core::fmt::Debug,
-{
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Iter").field("inner", &self.inner).finish()
-    }
-}
-
-impl<'a, T, const N: usize> Iterator for Iter<'a, T, N> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|e| unsafe { e.assume_init_ref() })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-}
-
-impl<T, const N: usize> DoubleEndedIterator for Iter<'_, T, N> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner
-            .next_back()
-            .map(|e| unsafe { e.assume_init_ref() })
-    }
-}
-
-impl<T, const N: usize> FusedIterator for Iter<'_, T, N> {}
-
-impl<T, const N: usize> ExactSizeIterator for Iter<'_, T, N> {
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-
-// ---
-
-pub struct IterMut<'a, T, const N: usize> {
-    inner: core::iter::Take<core::slice::IterMut<'a, MaybeUninit<T>>>,
-}
-
-impl<T, const N: usize> Default for IterMut<'_, T, N> {
-    fn default() -> Self {
-        Self {
-            inner: [].iter_mut().take(0),
-        }
-    }
-}
-
-impl<T, const N: usize> core::fmt::Debug for IterMut<'_, T, N>
-where
-    T: core::fmt::Debug,
-{
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("IterMut")
-            .field("inner", &self.inner)
-            .finish()
-    }
-}
-
-impl<'a, T, const N: usize> Iterator for IterMut<'a, T, N> {
-    type Item = &'a mut T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|e| unsafe { e.assume_init_mut() })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-}
-
-impl<T, const N: usize> DoubleEndedIterator for IterMut<'_, T, N> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner
-            .next_back()
-            .map(|e| unsafe { e.assume_init_mut() })
-    }
-}
-
-impl<T, const N: usize> FusedIterator for IterMut<'_, T, N> {}
-
-impl<T, const N: usize> ExactSizeIterator for IterMut<'_, T, N> {
-    fn len(&self) -> usize {
-        self.inner.len()
     }
 }
 
@@ -767,7 +676,6 @@ mod tests {
             "Capacity must match compile-time constant"
         );
         assert!(sut.is_empty(), "CapVec should be empty by default");
-        assert!(!sut.is_full(), "Empty CapVec should not be full");
         assert!(sut.as_slice().is_empty(), "Slice view should also be empty");
     }
 
@@ -779,10 +687,6 @@ mod tests {
         assert_eq!(sut.len(), 4, "Length should equal array length");
         assert_eq!(sut.capacity(), 4, "Capacity should equal compile-time N");
         assert!(!sut.is_empty(), "CapVec from array should not be empty");
-        assert!(
-            sut.is_full(),
-            "CapVec should be full when constructed from array"
-        );
         assert_eq!(sut.as_slice(), &SEED, "Contents must match source array");
     }
 
@@ -800,7 +704,7 @@ mod tests {
         );
         assert_eq!(sut.as_slice(), base.as_slice(), "Clone contents must match");
 
-        let _ = base.push(4);
+        base.push(4).unwrap();
         assert_ne!(
             sut.len(),
             base.len(),
@@ -821,7 +725,7 @@ mod tests {
         assert_eq!(sut.capacity(), 5);
         assert!(sut.as_slice().is_empty());
 
-        let _ = base.push(0);
+        base.push(0).unwrap();
         assert_ne!(
             sut.len(),
             base.len(),
@@ -844,7 +748,6 @@ mod tests {
             "Capacity must match compile-time constant"
         );
         assert!(sut.is_empty(), "CapVec should be empty by default");
-        assert!(!sut.is_full(), "Empty CapVec should not be full");
         assert!(sut.as_slice().is_empty(), "Slice view should also be empty");
     }
 
@@ -858,7 +761,6 @@ mod tests {
             "Capacity must match compile-time constant"
         );
         assert!(sut.is_empty(), "CapVec should be empty by default");
-        assert!(!sut.is_full(), "Empty CapVec should not be full");
 
         sut.push(10).unwrap();
         assert_eq!(sut.len(), 1, "Length should increase after one push");
@@ -914,27 +816,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_full() {
-        let mut sut = CapVec::<u8, 2>::new();
-        assert!(!sut.is_full(), "Empty CapVec should not be full");
-
-        sut.push(1).unwrap();
-        assert!(
-            !sut.is_full(),
-            "CapVec with one element (of 2) should not be full"
-        );
-
-        sut.push(2).unwrap();
-        assert!(
-            sut.is_full(),
-            "CapVec should report full once capacity is reached"
-        );
-
-        // Ensure pushing beyond capacity fails
-        assert_eq!(sut.push(3), Err(3), "Pushing beyond capacity should fail");
-    }
-
-    #[test]
     fn test_clear() {
         let mut sut = CapVec::<Box<str>, 3>::new();
         sut.push("a".into()).unwrap();
@@ -944,7 +825,6 @@ mod tests {
         sut.clear();
         assert_eq!(sut.len(), 0, "Clear should reset length to zero");
         assert!(sut.is_empty(), "CapVec should be empty after clear");
-        assert!(!sut.is_full(), "Empty CapVec should not be full");
 
         // Ensure subsequent reuse works fine
         sut.push("c".into()).unwrap();
@@ -998,7 +878,6 @@ mod tests {
     #[test]
     fn test_partially_fill_empty_vec_zst() {
         let mut sut = CapVec::<(), 4>::new();
-        assert!(!sut.is_full());
         assert!(sut.is_empty());
         assert_eq!(sut.len(), 0);
         assert_eq!(sut.as_slice(), []);
@@ -1006,7 +885,6 @@ mod tests {
         let mut leftover = sut.extend(core::iter::repeat(()).take(2));
         assert_eq!(leftover.next(), None);
 
-        assert!(!sut.is_full());
         assert!(!sut.is_empty());
         assert_eq!(sut.len(), 2);
         assert_eq!(sut.as_slice(), [(); 2]);
@@ -1015,7 +893,6 @@ mod tests {
     #[test]
     fn test_fill_empty_vec_zst() {
         let mut sut = CapVec::<(), 4>::new();
-        assert!(!sut.is_full());
         assert!(sut.is_empty());
         assert_eq!(sut.len(), 0);
         assert_eq!(sut.as_slice(), []);
@@ -1023,7 +900,6 @@ mod tests {
         let mut leftover = sut.extend(core::iter::repeat(()));
         assert_eq!(leftover.next(), Some(()));
 
-        assert!(sut.is_full());
         assert!(!sut.is_empty());
         assert_eq!(sut.len(), 4);
         assert_eq!(sut.as_slice(), [(); 4]);
@@ -1032,7 +908,6 @@ mod tests {
     #[test]
     fn test_extend_partially_filled_vec_zst() {
         let mut sut = CapVec::<(), 8>::new();
-        assert!(!sut.is_full());
         assert!(sut.is_empty());
         assert_eq!(sut.len(), 0);
         assert_eq!(sut.as_slice(), []);
@@ -1040,7 +915,6 @@ mod tests {
         let mut leftover = sut.extend(core::iter::repeat(()).take(3));
         assert_eq!(leftover.next(), None);
 
-        assert!(!sut.is_full());
         assert!(!sut.is_empty());
         assert_eq!(sut.len(), 3);
         assert_eq!(sut.as_slice(), [(); 3]);
@@ -1048,7 +922,6 @@ mod tests {
         let mut leftover = sut.extend(core::iter::repeat(()).take(3));
         assert_eq!(leftover.next(), None);
 
-        assert!(!sut.is_full());
         assert!(!sut.is_empty());
         assert_eq!(sut.len(), 6);
         assert_eq!(sut.as_slice(), [(); 6]);
@@ -1056,7 +929,6 @@ mod tests {
         let mut leftover = sut.extend(core::iter::repeat(()));
         assert_eq!(leftover.next(), Some(()));
 
-        assert!(sut.is_full());
         assert!(!sut.is_empty());
         assert_eq!(sut.len(), 8);
         assert_eq!(sut.as_slice(), [(); 8]);
@@ -1065,15 +937,13 @@ mod tests {
     #[test]
     fn test_extend_zero_capacity_vec() {
         let mut sut = CapVec::<(), 0>::new();
-        assert!(sut.is_full());
-        assert!(!sut.is_empty());
+        assert!(sut.is_empty());
         assert_eq!(sut.len(), 0);
         assert_eq!(sut.as_slice(), []);
 
         let mut leftover = sut.extend(core::iter::repeat(()));
         assert_eq!(leftover.next(), Some(()));
-        assert!(sut.is_full());
-        assert!(!sut.is_empty());
+        assert!(sut.is_empty());
         assert_eq!(sut.len(), 0);
         assert_eq!(sut.as_slice(), []);
     }
@@ -1130,6 +1000,39 @@ mod tests {
     }
 
     #[test]
+    fn test_push() {
+        let mut sut: CapVec<i64, 4> = CapVec::new();
+        assert_eq!(sut.len(), 0);
+        assert!(sut.is_empty());
+        assert_eq!(sut, &[][..]);
+
+        sut.push(0).unwrap();
+        assert_eq!(sut.len(), 1);
+        assert!(!sut.is_empty());
+        assert_eq!(sut, &[0][..]);
+
+        sut.push(1).unwrap();
+        assert_eq!(sut.len(), 2);
+        assert!(!sut.is_empty());
+        assert_eq!(sut, &[0, 1][..]);
+
+        sut.push(2).unwrap();
+        assert_eq!(sut.len(), 3);
+        assert!(!sut.is_empty());
+        assert_eq!(sut, &[0, 1, 2][..]);
+
+        sut.push(3).unwrap();
+        assert_eq!(sut.len(), 4);
+        assert!(!sut.is_empty());
+        assert_eq!(sut, &[0, 1, 2, 3][..]);
+
+        assert_eq!(sut.push(4), Err(4));
+        assert_eq!(sut.len(), 4);
+        assert!(!sut.is_empty());
+        assert_eq!(sut, &[0, 1, 2, 3][..]);
+    }
+
+    #[test]
     fn test_remove() {
         let mut sut: CapVec<i64, 6> = CapVec::new();
         assert_eq!(sut.len(), 0);
@@ -1180,11 +1083,43 @@ mod tests {
     }
 
     #[test]
-    fn test_pop_on_empty_vec() {
-        let mut sut: CapVec<i64, 6> = CapVec::new();
+    fn test_pop() {
+        let mut sut: CapVec<i64, 4> = CapVec::new();
+
+        let mut leftover = sut.extend(0..5);
+        assert_eq!(leftover.next(), Some(4));
+        assert_eq!(sut.len(), 4);
+        assert!(!sut.is_empty());
+
+        for i in (0..4).rev() {
+            assert_eq!(sut.pop(), Some(i));
+            assert_eq!(sut.len(), i as usize);
+        }
+
+        assert_eq!(sut.pop(), None);
         assert_eq!(sut.len(), 0);
         assert!(sut.is_empty());
-        assert_eq!(sut.pop(), None);
+    }
+
+    #[test]
+    fn test_mutability() {
+        let mut sut: CapVec<i64, 4> = CapVec::new();
+
+        let mut leftover = sut.extend(0..5);
+        assert_eq!(leftover.next(), Some(4));
+
+        assert_eq!(sut.len(), 4);
+        assert!(!sut.is_empty());
+        assert_eq!(sut, [0, 1, 2, 3]);
+
+        sut[0] *= 10;
+        sut[1] *= 10;
+        sut[2] *= 10;
+        sut[3] *= 10;
+
+        assert_eq!(sut, [0, 10, 20, 30]);
+        assert_eq!(sut.len(), 4);
+        assert!(!sut.is_empty());
     }
 
     #[test]
@@ -1204,6 +1139,37 @@ mod tests {
     }
 
     #[test]
+    fn test_comparison() {
+        let sut: CapVec<i64, 4> = CapVec::from([0, 1, 2, 3]);
+
+        assert_eq!(sut, sut);
+        assert_eq!(sut, sut.clone());
+
+        assert_eq!(sut, [0, 1, 2, 3]);
+        assert_eq!(sut, &[0, 1, 2, 3]);
+        assert_eq!(sut, [0, 1, 2, 3][..]);
+        assert_eq!(sut, &[0, 1, 2, 3][..]);
+        assert_eq!(sut, CapVec::from([0, 1, 2, 3]));
+
+        assert_ne!(sut, [0, 10, 20, 30]);
+        assert_ne!(sut, &[0, 10, 20, 30]);
+        assert_ne!(sut, [0, 10, 20, 30][..]);
+        assert_ne!(sut, &[0, 10, 20, 30][..]);
+        assert_ne!(sut, CapVec::from([0, 10, 20, 30]));
+
+        assert_ne!(sut, [][..]);
+        assert_ne!(sut, &[][..]);
+
+        let sut = CapVec::<i32, 4>::new();
+        assert_eq!(sut, sut);
+        assert_eq!(sut, sut.clone());
+
+        assert_eq!(sut, [][..]);
+        assert_eq!(sut, &[][..]);
+        assert_eq!(sut, CapVec::new());
+    }
+
+    #[test]
     fn test_drain_partially() {
         let mut sut = CapVec::<_, 8>::new();
         let mut leftover = sut.extend((0..8).map(Box::new));
@@ -1219,6 +1185,26 @@ mod tests {
         assert_eq!(sut.len(), 2);
         assert!(!sut.is_empty());
         assert_eq!(sut.as_slice(), [0, 7].map(Box::new));
+    }
+
+    #[test]
+    fn test_drain_from_both_ends() {
+        let mut sut = CapVec::<_, 8>::new();
+        let mut leftover = sut.extend((0..8).map(Box::new));
+        assert_eq!(leftover.next(), None);
+
+        assert_eq!(sut.len(), 8);
+        assert!(!sut.is_empty());
+        assert_eq!(sut, [0, 1, 2, 3, 4, 5, 6, 7].map(Box::new));
+
+        let mut iter = sut.drain(1..7);
+        assert_eq!(iter.next(), Some(Box::new(1)));
+        assert_eq!(iter.next_back(), Some(Box::new(6)));
+
+        assert_eq!(iter.next_back(), Some(Box::new(5)));
+        assert_eq!(iter.next(), Some(Box::new(2)));
+
+        assert_eq!(iter.len(), 2);
     }
 
     #[test]
@@ -1650,5 +1636,35 @@ mod tests {
 
         // ensure memory gets release correctly
         core::mem::drop(sut);
+    }
+
+    #[test]
+    fn test_ref_into_iter_equals_iter() {
+        let base = CapVec::from([0, 1, 2, 3]);
+        assert!(base.iter().eq(&base));
+
+        let base = CapVec::from([0; 0]);
+        assert!(base.iter().eq(&base));
+
+        let base = CapVec::from([(); 0]);
+        assert!(base.iter().eq(&base));
+
+        let base = CapVec::from([(); 5]);
+        assert!(base.iter().eq(&base));
+    }
+
+    #[test]
+    fn test_ref_mut_into_iter_equals_iter_mut() {
+        let mut base = CapVec::from([0, 1, 2, 3]);
+        assert!([0, 1, 2, 3].iter_mut().eq(&mut base));
+
+        let mut base = CapVec::from([0; 0]);
+        assert!([0; 0].iter_mut().eq(&mut base));
+
+        let mut base = CapVec::from([(); 0]);
+        assert!([(); 0].iter_mut().eq(&mut base));
+
+        let mut base = CapVec::from([(); 5]);
+        assert!([(); 5].iter_mut().eq(&mut base));
     }
 }
